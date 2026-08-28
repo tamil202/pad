@@ -5,7 +5,7 @@ import crypto from "crypto";
 // This is a minimal file-based store so the app runs with zero external
 // dependencies. Swap this module for a MySQL/TypeORM repository later —
 // the shape of PageRecord is exactly what you'd put in a `pages` table:
-//   id, title, width, height, background, stroke_json, ocr_text, created_at, updated_at
+//   id, title, width, height, background, stroke_json, ocr_text, mermaid, created_at, updated_at
 
 export interface StrokePoint {
   x: number;
@@ -42,6 +42,7 @@ export interface PageRecord {
   background: PaperBackground;
   strokes: Stroke[];
   ocrText: string | null;
+  mermaid: string | null;   // optional Mermaid diagram from Claude extraction
   createdAt: string;
   updatedAt: string;
 }
@@ -89,6 +90,7 @@ function normalize(record: any): PageRecord {
       points: s.points ?? [],
     })),
     ocrText: record.ocrText ?? null,
+    mermaid: record.mermaid ?? null,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt ?? record.createdAt,
   };
@@ -101,6 +103,7 @@ export function createPage(input: {
   background?: PaperBackground;
   strokes: Stroke[];
   ocrText?: string | null;
+  mermaid?: string | null;
 }): PageRecord {
   ensureDataDir();
   const now = new Date().toISOString();
@@ -112,6 +115,7 @@ export function createPage(input: {
     background: input.background ?? "blank",
     strokes: input.strokes,
     ocrText: input.ocrText ?? null,
+    mermaid: input.mermaid ?? null,
     createdAt: now,
     updatedAt: now,
   };
@@ -130,6 +134,7 @@ export function updatePage(
     background?: PaperBackground;
     strokes?: Stroke[];
     ocrText?: string | null;
+    mermaid?: string | null;
   }
 ): PageRecord | null {
   const existing = getPage(id);
@@ -142,6 +147,7 @@ export function updatePage(
     ...(patch.background !== undefined ? { background: patch.background } : {}),
     ...(patch.strokes !== undefined ? { strokes: patch.strokes } : {}),
     ...(patch.ocrText !== undefined ? { ocrText: patch.ocrText } : {}),
+    ...(patch.mermaid !== undefined ? { mermaid: patch.mermaid } : {}),
     updatedAt: new Date().toISOString(),
   };
   // id was already validated by the getPage() call above, so filePath(id) here

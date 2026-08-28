@@ -1,6 +1,4 @@
-import { readFileSync } from "fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Resvg, initWasm } from "@resvg/resvg-wasm";
 import { z } from "zod";
 import {
   createPage,
@@ -10,19 +8,7 @@ import {
   deletePage,
   Stroke,
 } from "./store";
-import { renderPageSVG } from "./render-svg";
-
-// resvg-wasm needs its .wasm binary loaded once before first use. Reading it
-// from disk (rather than fetch()) keeps this working with no network access,
-// same offline-first approach as the Note Mode OCR vendoring.
-let wasmReady: Promise<void> | null = null;
-function ensureResvgWasm(): Promise<void> {
-  if (!wasmReady) {
-    const wasmPath = require.resolve("@resvg/resvg-wasm/index_bg.wasm");
-    wasmReady = initWasm(readFileSync(wasmPath));
-  }
-  return wasmReady;
-}
+import { renderPagePng, renderPageSvgMarkup } from "./render-png";
 
 const strokePointSchema = z.object({
   x: z.number(),
@@ -83,8 +69,13 @@ export function createPadMcpServer(): McpServer {
     async ({ id }) => {
       const page = getPage(id);
       if (!page) return notFound(id);
-      const { strokes, ocrText, ...meta } = page;
-      const details = { ...meta, strokeCount: strokes.length, hasExtractedText: !!ocrText };
+      const { strokes, ocrText, mermaid, ...meta } = page;
+      const details = {
+        ...meta,
+        strokeCount: strokes.length,
+        hasExtractedText: !!ocrText,
+        hasMermaid: !!mermaid,
+      };
       return { content: [{ type: "text", text: JSON.stringify(details, null, 2) }] };
     }
   );
@@ -93,14 +84,23 @@ export function createPadMcpServer(): McpServer {
     "extract_page_text",
     {
       description:
-        "Get the extracted handwriting text for a saved page — the text captured by Note Mode's OCR when the page was written. Returns a note instead if the page has none (it was never written with Note Mode).",
+        "Get the extracted handwriting text for a saved page — the text captured by Note Mode's OCR, or by the on-demand Claude vision extraction, when the page was written. Includes a Mermaid diagram if one was extracted. Returns a note instead if the page has none.",
       inputSchema: { id: z.string().describe("Page id") },
     },
     async ({ id }) => {
       const page = getPage(id);
       if (!page) return notFound(id);
-      const text = page.ocrText ?? "(no extracted text — this page has no Note Mode OCR text saved)";
-      return { content: [{ type: "text", text }] };
+      if (!page.ocrText && !page.mermaid) {
+        return {
+          content: [
+            { type: "text", text: "(no extracted text — this page has no Note Mode or Claude-extracted text saved)" },
+          ],
+        };
+      }
+      const parts: string[] = [];
+      if (page.ocrText) parts.push(page.ocrText);
+      if (page.mermaid) parts.push("```mermaid\n" + page.mermaid + "\n```");
+      return { content: [{ type: "text", text: parts.join("\n\n") }] };
     }
   );
 
@@ -117,13 +117,11 @@ export function createPadMcpServer(): McpServer {
     async ({ id, format }) => {
       const page = getPage(id);
       if (!page) return notFound(id);
-      const svg = renderPageSVG(page.width, page.height, page.background, page.strokes);
       if (format === "svg") {
-        return { content: [{ type: "text", text: svg }] };
+        return { content: [{ type: "text", text: renderPageSvgMarkup(page) }] };
       }
-      await ensureResvgWasm();
-      const png = new Resvg(svg).render().asPng();
-      return { content: [{ type: "image", data: Buffer.from(png).toString("base64"), mimeType: "image/png" }] };
+      const png = await renderPagePng(page);
+      return { content: [{ type: "image", data: png.toString("base64"), mimeType: "image/png" }] };
     }
   );
 

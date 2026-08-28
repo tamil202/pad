@@ -12,6 +12,8 @@ import {
   PaperBackground,
 } from "./store";
 import { createPadMcpServer } from "./mcp";
+import { renderPagePng } from "./render-png";
+import { extractPageImage } from "./claude-extract";
 
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
@@ -63,20 +65,21 @@ app.use(
 
 // Save a new (finished or in-progress) page
 app.post("/api/pages", (req: Request, res: Response) => {
-  const { title, width, height, background, strokes, ocrText } = req.body as {
+  const { title, width, height, background, strokes, ocrText, mermaid } = req.body as {
     title?: string;
     width?: number;
     height?: number;
     background?: PaperBackground;
     strokes?: Stroke[];
     ocrText?: string | null;
+    mermaid?: string | null;
   };
 
   if (!width || !height || !Array.isArray(strokes)) {
     return res.status(400).json({ error: "width, height and strokes[] are required" });
   }
 
-  const page = createPage({ title, width, height, background, strokes, ocrText });
+  const page = createPage({ title, width, height, background, strokes, ocrText, mermaid });
   res.status(201).json({ id: page.id });
 });
 
@@ -103,13 +106,14 @@ app.get("/api/pages/:id", (req: Request, res: Response) => {
 
 // Update an existing page (edit strokes, rename, change background, store OCR)
 app.put("/api/pages/:id", (req: Request, res: Response) => {
-  const { title, width, height, background, strokes, ocrText } = req.body as {
+  const { title, width, height, background, strokes, ocrText, mermaid } = req.body as {
     title?: string;
     width?: number;
     height?: number;
     background?: PaperBackground;
     strokes?: Stroke[];
     ocrText?: string | null;
+    mermaid?: string | null;
   };
   const updated = updatePage(req.params.id, {
     title,
@@ -118,6 +122,7 @@ app.put("/api/pages/:id", (req: Request, res: Response) => {
     background,
     strokes,
     ocrText,
+    mermaid,
   });
   if (!updated) return res.status(404).json({ error: "not found" });
   res.json({ id: updated.id, updatedAt: updated.updatedAt });
@@ -128,6 +133,39 @@ app.delete("/api/pages/:id", (req: Request, res: Response) => {
   const ok = deletePage(req.params.id);
   if (!ok) return res.status(404).json({ error: "not found" });
   res.status(204).end();
+});
+
+// Extract a page's handwriting with Claude vision. Renders the stored ink to a
+// PNG, hands it to the local Claude CLI (native vision — no separate OCR step),
+// and saves the returned text + optional Mermaid diagram back onto the page so
+// it's searchable. This is the server-side "Claude replaces Textract" path;
+// Note Mode's client-side OCR remains the offline fallback.
+//
+// Each call spawns a `claude -p` subprocess, so it's intentionally on-demand
+// (not run on every save). In-flight guard keeps a burst of clicks from
+// launching many CLI processes at once for the same page.
+const extractionsInFlight = new Set<string>();
+
+app.post("/api/pages/:id/extract", async (req: Request, res: Response) => {
+  const id = req.params.id;
+  const page = getPage(id);
+  if (!page) return res.status(404).json({ error: "not found" });
+
+  if (extractionsInFlight.has(id)) {
+    return res.status(409).json({ error: "extraction already in progress for this page" });
+  }
+  extractionsInFlight.add(id);
+  try {
+    const png = await renderPagePng(page);
+    const { text, mermaid } = await extractPageImage(png);
+    const updated = updatePage(id, { ocrText: text, mermaid });
+    res.json({ id, text, mermaid, updatedAt: updated?.updatedAt });
+  } catch (err) {
+    console.error("Claude extraction failed:", err);
+    res.status(502).json({ error: "extraction failed", detail: String((err as Error)?.message || err) });
+  } finally {
+    extractionsInFlight.delete(id);
+  }
 });
 
 // ---- Remote MCP server ----------------------------------------------------
@@ -188,8 +226,29 @@ app.get("/page/:id", (req: Request, res: Response) => {
       <symbol id="i-restart" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></symbol>
       <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
       <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+      <symbol id="i-extract" viewBox="0 0 24 24"><path d="M4 7V4h16v3"/><path d="M9 20h6"/><path d="M12 4v16"/></symbol>
     </defs>
   </svg>
+
+  <style>
+    .extract-panel{position:fixed;top:0;right:0;bottom:0;width:min(420px,90vw);background:var(--panel-bg,#fff);color:var(--panel-fg,#1e293b);box-shadow:-8px 0 24px rgba(0,0,0,.15);display:flex;flex-direction:column;z-index:20;font:14px/1.5 system-ui,sans-serif}
+    .extract-panel[hidden]{display:none}
+    .extract-head{display:flex;align-items:center;gap:8px;padding:14px 16px;border-bottom:1px solid rgba(0,0,0,.1)}
+    .extract-head strong{flex:1;font-size:15px}
+    .extract-body{padding:16px;overflow:auto;flex:1}
+    .extract-run{width:100%;padding:10px;border:0;border-radius:8px;background:#2563eb;color:#fff;font-weight:600;cursor:pointer}
+    .extract-run:disabled{opacity:.6;cursor:progress}
+    .extract-status{margin:12px 0;color:#64748b;min-height:1.2em}
+    .extract-status.error{color:#dc2626}
+    .extract-text,.extract-mermaid{white-space:pre-wrap;word-break:break-word;background:rgba(0,0,0,.04);border-radius:8px;padding:12px;margin:8px 0 0}
+    .extract-mermaid{font-family:ui-monospace,monospace;font-size:12.5px}
+    .extract-panel h4{margin:18px 0 0;font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:#64748b}
+    .extract-close{background:none;border:0;font-size:22px;line-height:1;cursor:pointer;color:inherit}
+    @media (prefers-color-scheme:dark){
+      .extract-panel{--panel-bg:#0f172a;--panel-fg:#e2e8f0}
+      .extract-text,.extract-mermaid{background:rgba(255,255,255,.06)}
+    }
+  </style>
 
   <header class="viewer-header">
     <span class="brand-mark"><svg class="icon"><use href="#i-eye" /></svg></span>
@@ -203,6 +262,7 @@ app.get("/page/:id", (req: Request, res: Response) => {
       <button id="speedBtn" class="icon-only wide" title="Playback speed">1×</button>
     </div>
 
+    <button id="extractBtn" class="icon-only" title="Extract text with Claude" aria-label="Extract text with Claude"><svg class="icon"><use href="#i-extract" /></svg></button>
     <button id="downloadBtn" class="icon-only" title="Download PNG" aria-label="Download PNG"><svg class="icon"><use href="#i-download" /></svg></button>
     <button id="shareBtn" class="icon-only" title="Copy share link" aria-label="Copy link"><svg class="icon"><use href="#i-link" /></svg></button>
     <a href="/" class="btn-link" title="Back to pad"><svg class="icon"><use href="#i-back" /></svg><span class="label">Back</span></a>
@@ -213,6 +273,22 @@ app.get("/page/:id", (req: Request, res: Response) => {
       <canvas id="viewCanvas"></canvas>
     </div>
   </main>
+
+  <aside id="extractPanel" class="extract-panel" hidden aria-label="Claude text extraction">
+    <div class="extract-head">
+      <strong>Claude extraction</strong>
+      <button id="extractClose" class="extract-close" title="Close" aria-label="Close">&times;</button>
+    </div>
+    <div class="extract-body">
+      <button id="extractRun" class="extract-run">Extract with Claude</button>
+      <div id="extractStatus" class="extract-status"></div>
+      <h4 id="extractTextLabel" hidden>Text</h4>
+      <pre id="extractText" class="extract-text" hidden></pre>
+      <h4 id="extractMermaidLabel" hidden>Mermaid diagram</h4>
+      <pre id="extractMermaid" class="extract-mermaid" hidden></pre>
+    </div>
+  </aside>
+
   <script>
     window.__PAGE_ID__ = ${JSON.stringify(page.id)};
   </script>

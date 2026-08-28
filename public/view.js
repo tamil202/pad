@@ -111,6 +111,66 @@
     } catch { shareBtn.title = "Copy failed"; }
   });
 
+  // ---- Claude text extraction panel --------------------------------------
+  // Sends the page to the server's /extract endpoint, which renders the ink to
+  // a PNG and has the Claude CLI read it (native vision → text + optional
+  // Mermaid). The result is saved on the page, so it prefills next time.
+  const extractBtn = document.getElementById("extractBtn");
+  const extractPanel = document.getElementById("extractPanel");
+  const extractClose = document.getElementById("extractClose");
+  const extractRun = document.getElementById("extractRun");
+  const extractStatus = document.getElementById("extractStatus");
+  const extractTextEl = document.getElementById("extractText");
+  const extractTextLabel = document.getElementById("extractTextLabel");
+  const extractMermaidEl = document.getElementById("extractMermaid");
+  const extractMermaidLabel = document.getElementById("extractMermaidLabel");
+
+  function showExtractResult(text, mermaid) {
+    const hasText = !!(text && text.trim());
+    extractTextEl.textContent = hasText ? text : "(no handwriting text found)";
+    extractTextEl.hidden = false;
+    extractTextLabel.hidden = false;
+    const hasMermaid = !!(mermaid && mermaid.trim());
+    extractMermaidEl.textContent = hasMermaid ? mermaid : "";
+    extractMermaidEl.hidden = !hasMermaid;
+    extractMermaidLabel.hidden = !hasMermaid;
+  }
+
+  function openExtractPanel() {
+    extractPanel.hidden = false;
+    if ((page.ocrText && page.ocrText.trim()) || (page.mermaid && page.mermaid.trim())) {
+      showExtractResult(page.ocrText, page.mermaid);
+      extractRun.textContent = "Re-extract with Claude";
+      extractStatus.textContent = "Showing previously extracted text.";
+      extractStatus.className = "extract-status";
+    }
+  }
+
+  extractBtn.addEventListener("click", openExtractPanel);
+  extractClose.addEventListener("click", () => { extractPanel.hidden = true; });
+
+  extractRun.addEventListener("click", async () => {
+    extractRun.disabled = true;
+    extractStatus.textContent = "Extracting with Claude… this can take a while.";
+    extractStatus.className = "extract-status";
+    try {
+      const r = await fetch(`/api/pages/${window.__PAGE_ID__}/extract`, { method: "POST" });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.detail || data.error || `HTTP ${r.status}`);
+      page.ocrText = data.text;
+      page.mermaid = data.mermaid;
+      showExtractResult(data.text, data.mermaid);
+      extractRun.textContent = "Re-extract with Claude";
+      extractStatus.textContent = "Done ✓ — saved to the page.";
+      extractStatus.className = "extract-status";
+    } catch (e) {
+      extractStatus.textContent = "Extraction failed: " + (e && e.message ? e.message : e);
+      extractStatus.className = "extract-status error";
+    } finally {
+      extractRun.disabled = false;
+    }
+  });
+
   window.addEventListener("keydown", (e) => {
     if (e.key === " ") { e.preventDefault(); playing ? pause() : play(); }
   });
