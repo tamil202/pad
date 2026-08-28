@@ -1,0 +1,15 @@
+# Keep the build context small & the image clean.
+node_modules
+dist
+data
+.git
+.gitignore
+*.log
+npm-debug.log*
+Dockerfile
+docker-compose.yml
+.dockerignore
+DEPLOY.md
+DOCKER.md
+deploy
+scratchpad

@@ -1,0 +1,25 @@
+{
+  "name": "pad-app",
+  "version": "1.0.0",
+  "description": "HUION HS64 pen-pad capture app: draw a full page, save strokes as JSON, replay/show the finished page.",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "ts-node src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "serve": "NODE_ENV=production node dist/server.js",
+    "prod": "npm run build && NODE_ENV=production node dist/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "ts-node": "^10.9.2",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.9"
+  }
+}

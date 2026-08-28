@@ -1,0 +1,15 @@
+# Dependencies & build output
+node_modules/
+dist/
+
+# App data (saved pages are runtime/user data, not source)
+data/
+
+# Logs & OS/editor cruft
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# Scratch / temp
+scratchpad/

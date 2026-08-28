@@ -1,0 +1,21 @@
+[Unit]
+Description=Pen Pad - handwriting capture app
+After=network.target
+
+[Service]
+Type=simple
+# Adjust User/WorkingDirectory to wherever you copied the app on the Pi.
+User=pi
+WorkingDirectory=/home/pi/pad
+Environment=NODE_ENV=production
+Environment=PORT=3000
+# Runs the pre-compiled JS (dist/server.js) — NOT ts-node — so the Pi doesn't
+# pay a TypeScript compile on every boot.
+ExecStart=/usr/bin/node dist/server.js
+Restart=on-failure
+RestartSec=3
+# Light hardening / resource friendliness
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

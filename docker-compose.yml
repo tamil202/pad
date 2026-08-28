@@ -1,0 +1,67 @@
+# ===========================================================================
+# Pen Pad — Docker Compose for Raspberry Pi
+#
+#   docker compose up -d --build      # build + run in the background
+#   docker compose logs -f            # follow logs
+#   docker compose down               # stop & remove (data is kept on host)
+#
+# Node.js runs INSIDE the container (from the base image); your host's Node
+# install is not touched.
+# ===========================================================================
+
+services:
+  pad:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pen-pad:latest
+    container_name: pen-pad
+    restart: unless-stopped
+    init: true                       # proper PID-1 signal handling / zombie reaping
+
+    ports:
+      - "3000:3000"                  # host:container — open http://<pi-ip>:3000
+
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      # ---- Memory management -------------------------------------------------
+      # Cap the V8 heap so Node can't balloon past the Pi's RAM. Tune per model:
+      #   Pi Zero / 1  (512MB) -> 128
+      #   Pi 3         (1GB)   -> 192
+      #   Pi 4 / 5     (2GB+)  -> 256–384
+      NODE_OPTIONS: "--max-old-space-size=256"
+
+    volumes:
+      - ./data:/app/data             # persist saved pages on the host SD card
+
+    # ---- Container resource limits (Docker Compose v2 honours these) ---------
+    deploy:
+      resources:
+        limits:
+          memory: 512M               # hard cap; container is killed if exceeded
+          cpus: "1.50"
+        reservations:
+          memory: 128M
+    # Legacy docker-compose v1? Delete the `deploy:` block above and use:
+    #   mem_limit: 512m
+    #   mem_reservation: 128m
+    #   cpus: 1.5
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://localhost:'+(process.env.PORT||3000)+'/api/pages',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # Cap log growth so it doesn't wear out / fill the SD card.
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
