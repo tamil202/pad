@@ -1,5 +1,7 @@
-import express, { Request, Response } from "express";
+import express, { NextFunction, Request, Response } from "express";
 import path from "path";
+import { randomBytes, timingSafeEqual } from "crypto";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   createPage,
   getPage,
@@ -9,10 +11,33 @@ import {
   Stroke,
   PaperBackground,
 } from "./store";
+import { createPadMcpServer } from "./mcp";
 
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 const isProd = process.env.NODE_ENV === "production";
+
+// Remote MCP access — bearer-token auth. Set MCP_AUTH_TOKEN explicitly (e.g.
+// in docker-compose.yml) so it survives restarts; otherwise a fresh one is
+// generated and logged once per boot.
+const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || randomBytes(24).toString("hex");
+if (!process.env.MCP_AUTH_TOKEN) {
+  console.log("\n[mcp] MCP_AUTH_TOKEN not set — generated a token for this run:");
+  console.log(`[mcp]   ${MCP_AUTH_TOKEN}`);
+  console.log("[mcp] Set MCP_AUTH_TOKEN yourself to keep this stable across restarts.\n");
+}
+
+function requireMcpAuth(req: Request, res: Response, next: NextFunction): void {
+  const [scheme, token] = (req.header("authorization") || "").split(" ");
+  const expected = Buffer.from(MCP_AUTH_TOKEN);
+  const provided = Buffer.from(token || "");
+  const ok = scheme === "Bearer" && provided.length === expected.length && timingSafeEqual(provided, expected);
+  if (!ok) {
+    res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
+    return;
+  }
+  next();
+}
 
 app.disable("x-powered-by");
 app.set("etag", "strong"); // 304 revalidation instead of re-sending unchanged bodies
@@ -103,6 +128,37 @@ app.delete("/api/pages/:id", (req: Request, res: Response) => {
   const ok = deletePage(req.params.id);
   if (!ok) return res.status(404).json({ error: "not found" });
   res.status(204).end();
+});
+
+// ---- Remote MCP server ----------------------------------------------------
+// Stateless Streamable HTTP: each request gets a fresh server+transport pair,
+// so there's no session store to manage — the right fit for a single-user
+// personal deployment.
+
+app.post("/mcp", requireMcpAuth, async (req: Request, res: Response) => {
+  try {
+    const mcpServer = createPadMcpServer();
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    res.on("close", () => {
+      transport.close();
+      mcpServer.close();
+    });
+    await mcpServer.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error("MCP request error:", err);
+    if (!res.headersSent) {
+      res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal server error" }, id: null });
+    }
+  }
+});
+
+app.get("/mcp", requireMcpAuth, (_req: Request, res: Response) => {
+  res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null });
+});
+
+app.delete("/mcp", requireMcpAuth, (_req: Request, res: Response) => {
+  res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null });
 });
 
 // ---- Server-rendered "show the full page" view ---------------------------

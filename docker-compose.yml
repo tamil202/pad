@@ -24,7 +24,12 @@ services:
 
     environment:
       NODE_ENV: production
-      PORT: "3000"
+      PORT: "3010"
+      # ---- Remote MCP access --------------------------------------------------
+      # Bearer token for POST/GET/DELETE /mcp. Set this explicitly so it's
+      # stable across restarts — otherwise a fresh token is generated and
+      # logged on every boot, breaking any client already configured with it.
+      # MCP_AUTH_TOKEN: "generate-a-long-random-string-here"
       # ---- Memory management -------------------------------------------------
       # Cap the V8 heap so Node can't balloon past the Pi's RAM. Tune per model:
       #   Pi Zero / 1  (512MB) -> 128

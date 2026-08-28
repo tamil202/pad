@@ -62,7 +62,13 @@ function ensureDataDir(): void {
   }
 }
 
-function filePath(id: string): string {
+// Page ids are always crypto.randomUUID() output. Rejecting anything else here
+// (rather than just interpolating it into a path) closes off path traversal —
+// e.g. an id of "../../../etc/passwd" — for every caller, REST and MCP alike.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function filePath(id: string): string | null {
+  if (!UUID_RE.test(id)) return null;
   return path.join(DATA_DIR, `${id}.json`);
 }
 
@@ -109,7 +115,8 @@ export function createPage(input: {
     createdAt: now,
     updatedAt: now,
   };
-  fs.writeFileSync(filePath(record.id), JSON.stringify(record, null, 2));
+  // record.id is a freshly generated crypto.randomUUID(), always valid.
+  fs.writeFileSync(filePath(record.id) as string, JSON.stringify(record, null, 2));
   invalidateListCache();
   return record;
 }
@@ -137,7 +144,9 @@ export function updatePage(
     ...(patch.ocrText !== undefined ? { ocrText: patch.ocrText } : {}),
     updatedAt: new Date().toISOString(),
   };
-  fs.writeFileSync(filePath(id), JSON.stringify(updated, null, 2));
+  // id was already validated by the getPage() call above, so filePath(id) here
+  // is guaranteed non-null.
+  fs.writeFileSync(filePath(id) as string, JSON.stringify(updated, null, 2));
   invalidateListCache();
   return updated;
 }
@@ -145,7 +154,7 @@ export function updatePage(
 export function deletePage(id: string): boolean {
   ensureDataDir();
   const fp = filePath(id);
-  if (!fs.existsSync(fp)) return false;
+  if (!fp || !fs.existsSync(fp)) return false;
   fs.unlinkSync(fp);
   invalidateListCache();
   return true;
@@ -154,7 +163,7 @@ export function deletePage(id: string): boolean {
 export function getPage(id: string): PageRecord | null {
   ensureDataDir();
   const fp = filePath(id);
-  if (!fs.existsSync(fp)) return null;
+  if (!fp || !fs.existsSync(fp)) return null;
   return normalize(JSON.parse(fs.readFileSync(fp, "utf-8")));
 }
 
