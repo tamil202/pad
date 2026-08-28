@@ -20,11 +20,12 @@ services:
     init: true                       # proper PID-1 signal handling / zombie reaping
 
     ports:
-      - "3000:3000"                  # host:container — open http://<pi-ip>:3000
+      - "3010:3000"                  # host:container — open http://<pi-ip>:3010
+                                      # (host 3000 was already taken by another app on this Pi;
+                                      # the container still listens on 3000 internally, unchanged)
 
     environment:
       NODE_ENV: production
-      PORT: "3000"
       # ---- Remote MCP access --------------------------------------------------
       # Bearer token for POST/GET/DELETE /mcp. Set this explicitly so it's
       # stable across restarts — otherwise a fresh token is generated and
