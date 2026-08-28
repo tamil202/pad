@@ -159,8 +159,11 @@ function endGesture() {
   } else if (gesture.type === "eraser" && !gesture.erasedAny) {
     history.pop(); // erased nothing → no undo step
   }
-  // In Note Mode, hand the finished ink stroke to the recognizer.
-  if (noteMode && gesture.type === "free") feedStrokeToHw(gesture.stroke);
+  // In Note Mode, hand the finished ink stroke to whichever recognizer is active.
+  if (noteMode && gesture.type === "free") {
+    if (hwSupported) feedStrokeToHw(gesture.stroke);
+    else if (tessReady) scheduleTessRecognize();
+  }
   gesture = null;
   updateHistoryButtons();
   scheduleAutosave();
@@ -666,8 +669,11 @@ async function renderThumb(canvasEl, id) {
 
 // ---- Note Mode (handwriting → text, line by line) --------------------------
 // Uses the browser's native Handwriting Recognition API where available
-// (offline, no dependency). Where it isn't, the panel degrades to a typed
-// notes area. Either way the text is saved as the page's ocrText → searchable.
+// (offline, no dependency, mostly ChromeOS). Where it isn't, we fall back to
+// Tesseract.js running fully offline (self-hosted wasm + English model under
+// /vendor — no CDN calls) so auto-convert still works on a plain desktop/Pi
+// browser. If even that fails to load, the panel degrades to a typed notes
+// area. Either way the text is saved as the page's ocrText → searchable.
 let noteMode = false;
 let hwRecognizer = null;
 let hwDrawing = null;
@@ -678,17 +684,31 @@ let noteRecognizeTimer = null;
 let noteAutoCommitTimer = null;
 let noteBullets = false;
 
+// Tesseract.js fallback state
+let tessWorker = null;
+let tessReady = false;
+let tessLoading = false;
+let tessBusy = false;    // a recognize() call is in flight
+let tessDirty = false;   // ink changed again while tessBusy — re-run when it frees up
+let noteLineStart = 0;   // strokes[] index where the current (uncommitted) line begins —
+                          // keeps pre-existing page ink out of the OCR image, mirroring
+                          // how the native recognizer only ever sees strokes fed to it
+                          // after Note Mode started.
+
 async function initHw() {
   hwTried = true;
-  if (!("createHandwritingRecognizer" in navigator)) { hwSupported = false; return; }
-  try {
-    hwRecognizer = await navigator.createHandwritingRecognizer({ languages: ["en"] });
-    hwSupported = true;
-    startHwLine();
-  } catch (e) {
-    console.warn("Handwriting recognizer unavailable:", e);
-    hwSupported = false;
+  if ("createHandwritingRecognizer" in navigator) {
+    try {
+      hwRecognizer = await navigator.createHandwritingRecognizer({ languages: ["en"] });
+      hwSupported = true;
+      startHwLine();
+      return;
+    } catch (e) {
+      console.warn("Handwriting recognizer unavailable:", e);
+      hwSupported = false;
+    }
   }
+  await initTess();
 }
 function startHwLine() {
   if (!hwRecognizer) return;
@@ -696,22 +716,90 @@ function startHwLine() {
   catch { hwDrawing = null; }
 }
 
+function loadScriptOnce(src) {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[src="${src}"]`)) return resolve();
+    const s = document.createElement("script");
+    s.src = src;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error("failed to load " + src));
+    document.head.appendChild(s);
+  });
+}
+
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("timed out after " + ms + "ms")), ms);
+    promise.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
+async function initTess() {
+  tessLoading = true;
+  setNoteStatus();
+  try {
+    if (typeof Tesseract === "undefined") await withTimeout(loadScriptOnce("/vendor/tesseract/tesseract.min.js"), 15000);
+    // Tesseract.js v7 silently swallows a failed language-data fetch inside
+    // createWorker (it never calls its own reject path for that stage), so
+    // without a timeout a bad/missing vendor file would hang here forever —
+    // leaving Note Mode stuck on "Loading…" with no route to the typed
+    // fallback. Race it against our own timeout so we always resolve.
+    tessWorker = await withTimeout(Tesseract.createWorker("eng", 1, {
+      workerPath: "/vendor/tesseract/worker.min.js",
+      corePath: "/vendor/tesseract/tesseract-core-simd-lstm.js",
+      langPath: "/vendor/tessdata",
+      // All of the above are same-origin, so skip the blob-URL worker wrapper
+      // Tesseract.js uses to load cross-origin (CDN) scripts — with it on,
+      // the worker's self.location becomes an opaque blob: URL, which breaks
+      // the wasm core's *relative* fetch for its sibling .wasm file.
+      workerBlobURL: false,
+    }), 20000);
+    // Each recognize() call gets one handwritten line — segmenting as a single
+    // line (rather than a full-page layout guess) is far more accurate here.
+    await withTimeout(tessWorker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.SINGLE_LINE }), 5000);
+    tessReady = true;
+  } catch (e) {
+    console.warn("Offline OCR (Tesseract) unavailable:", e);
+    tessReady = false;
+    tessWorker = null;
+  } finally {
+    tessLoading = false;
+  }
+}
+
 async function setNoteMode(on) {
   noteMode = on;
   document.body.classList.toggle("note-mode", on);
   document.getElementById("noteBtn").classList.toggle("note-on", on);
   requestAnimationFrame(fitCanvasToScreen);
-  if (on && !hwTried) await initHw();
+  if (on) noteLineStart = strokes.length;
+  if (on && !hwTried) {
+    setNoteStatus();
+    await initHw();
+  }
   if (on) setNoteStatus();
 }
 function toggleNoteMode() { setNoteMode(!noteMode); }
 function setNoteStatus() {
   const el = document.getElementById("noteStatus");
-  if (hwSupported) {
+  if (!hwTried) {
+    el.textContent = "Checking handwriting recognition…";
+    el.className = "note-status";
+  } else if (hwSupported) {
     el.textContent = "Write a line on the pad — it's recognized automatically. Enter (or Commit) starts a new line.";
     el.className = "note-status";
+  } else if (tessLoading) {
+    el.textContent = "Loading offline handwriting recognition (first time only)…";
+    el.className = "note-status";
+  } else if (tessReady) {
+    // Offline OCR (Tesseract) segments characters by the gaps between them —
+    // it reads separated print letters well but misreads joined/cursive
+    // strokes (measured: a joined "hello" came back "nello" at 85% vs. 96%
+    // separated). This is the one thing that reliably moves its accuracy.
+    el.textContent = "Offline OCR active — print with small gaps between letters (not cursive) for best accuracy. Pause to recognize, Enter for a new line.";
+    el.className = "note-status";
   } else {
-    el.textContent = "Live handwriting recognition isn't available in this browser. You can type notes here — they're saved with the page and searchable. (Want offline OCR on the Pi? I can add a Tesseract engine.)";
+    el.textContent = "Handwriting recognition isn't available in this browser. You can type notes here — they're saved with the page and searchable.";
     el.className = "note-status warn";
   }
 }
@@ -736,6 +824,59 @@ async function recognizeCurrent() {
     document.getElementById("noteCurrent").textContent = noteCurrentText;
   } catch (e) { console.warn(e); }
 }
+
+// Tesseract path: there's no incremental "add this stroke" API — instead we
+// re-render the whole current line to an offscreen bitmap and re-run OCR on
+// it, debounced so a fast scribbler doesn't queue up overlapping recognitions.
+function scheduleTessRecognize() {
+  clearTimeout(noteRecognizeTimer);
+  noteRecognizeTimer = setTimeout(runTessRecognize, 600);
+  clearTimeout(noteAutoCommitTimer);
+  noteAutoCommitTimer = setTimeout(commitLine, 4000); // long pause → new line
+}
+function renderLineCanvas() {
+  const lineStrokes = strokes.slice(noteLineStart);
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const s of lineStrokes) for (const p of s.points) {
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+  }
+  if (!isFinite(minX) || maxX - minX < 2 || maxY - minY < 2) return null;
+
+  const pad = 24;
+  const scale = 2; // upscale — Tesseract reads larger text more reliably
+  const off = document.createElement("canvas");
+  off.width = Math.ceil((maxX - minX + pad * 2) * scale);
+  off.height = Math.ceil((maxY - minY + pad * 2) * scale);
+  const octx = off.getContext("2d");
+  octx.fillStyle = "#fff";
+  octx.fillRect(0, 0, off.width, off.height);
+  octx.translate((pad - minX) * scale, (pad - minY) * scale);
+  octx.scale(scale, scale);
+  // Force black ink for OCR contrast regardless of the pen's actual color.
+  for (const s of lineStrokes) drawStroke(octx, { ...s, color: "#000" });
+  return off;
+}
+async function runTessRecognize() {
+  if (!tessReady) return;
+  if (tessBusy) { tessDirty = true; return; }
+  const img = renderLineCanvas();
+  if (!img) return;
+  tessBusy = true;
+  try {
+    const { data } = await tessWorker.recognize(img);
+    noteCurrentText = (data.text || "").replace(/\s+/g, " ").trim();
+    document.getElementById("noteCurrent").textContent = noteCurrentText;
+  } catch (e) {
+    console.warn("Tesseract recognize failed:", e);
+  } finally {
+    tessBusy = false;
+    if (tessDirty) { tessDirty = false; runTessRecognize(); }
+  }
+}
+
 function commitLine() {
   clearTimeout(noteAutoCommitTimer);
   const cur = (noteCurrentText || "").trim();
@@ -746,11 +887,13 @@ function commitLine() {
     ta.scrollTop = ta.scrollHeight;
   }
   noteCurrentText = "";
+  tessDirty = false;
   document.getElementById("noteCurrent").textContent = "";
   startHwLine();
   // Clear the ink so the next line has a fresh page to write on — but only when
   // recognition is actually driving the flow (don't wipe a fallback user's ink).
-  if (hwSupported && strokes.length) { pushHistory(); strokes = []; redraw(); updateHistoryButtons(); }
+  if ((hwSupported || tessReady) && strokes.length) { pushHistory(); strokes = []; redraw(); updateHistoryButtons(); }
+  noteLineStart = strokes.length;
 }
 
 document.getElementById("noteBtn").addEventListener("click", toggleNoteMode);
