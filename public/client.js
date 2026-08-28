@@ -15,6 +15,11 @@ const undoBtn = document.getElementById("undoBtn");
 const redoBtn = document.getElementById("redoBtn");
 const finishBtn = document.getElementById("finishBtn");
 const importFile = document.getElementById("importFile");
+const padScroll = document.getElementById("padScroll");
+const zoomInBtn = document.getElementById("zoomIn");
+const zoomOutBtn = document.getElementById("zoomOut");
+const zoomResetBtn = document.getElementById("zoomReset");
+const panToggleBtn = document.getElementById("panToggle");
 
 // ---- State -----------------------------------------------------------------
 /** @type {Array} */ let strokes = [];
@@ -30,6 +35,21 @@ let editingId = null;          // set when editing an existing saved page
 let recentColors = ["#111111", "#e11d48", "#2563eb", "#16a34a", "#f59e0b", "#7c3aed"];
 let autosaveTimer = null;
 
+// ---- Zoom / scroll state ---------------------------------------------------
+// The page is a fixed sheet at the canvas's intrinsic resolution; `zoom` only
+// changes its on-screen size, and the .pad-scroll container handles panning.
+const PAGE_W = canvas.width;   // intrinsic page width  (px) — never changes
+const PAGE_H = canvas.height;  // intrinsic page height (px)
+const ZOOM_MIN = 0.1, ZOOM_MAX = 6;
+let zoom = 1;
+let fitMode = true;            // track the viewport width on resize until the user zooms
+let panMode = false;           // hand tool: drag pans instead of draws
+let spaceHeld = false;         // holding Space temporarily pans
+
+// Dropped background image to trace/annotate over (data URL + loaded element).
+let bgImageData = null;
+let bgImageEl = null;
+
 const SHAPE_TOOLS = ["line", "rect", "ellipse", "arrow"];
 const isShape = (t) => SHAPE_TOOLS.includes(t);
 const clone = (v) => JSON.parse(JSON.stringify(v));
@@ -41,9 +61,9 @@ loadSettings();
 applyTool(currentTool);
 renderSwatches();
 syncWidthLabel();
-fitCanvasToScreen();
+initViewport();
 updateHistoryButtons();
-window.addEventListener("resize", fitCanvasToScreen);
+window.addEventListener("resize", onResize);
 
 // Load an existing page for editing (?id=…), else restore an autosaved draft.
 (function bootstrap() {
@@ -52,27 +72,88 @@ window.addEventListener("resize", fitCanvasToScreen);
   else restoreDraft();
 })();
 
-// ---- Canvas sizing ---------------------------------------------------------
-function fitCanvasToScreen() {
-  const rect = canvas.getBoundingClientRect();
-  const newW = Math.max(1, Math.round(rect.width));
-  const newH = Math.max(1, Math.round(rect.height));
-  const oldW = canvas.width;
-  const oldH = canvas.height;
-  if (newW !== oldW || newH !== oldH) {
-    if (oldW && oldH && strokes.length) {
-      const sx = newW / oldW;
-      const sy = newH / oldH;
-      for (const s of strokes) for (const p of s.points) { p.x *= sx; p.y *= sy; }
-    }
-    canvas.width = newW;
-    canvas.height = newH;
-  }
+// ---- Canvas sizing / zoom / scroll -----------------------------------------
+// The canvas bitmap stays at PAGE_W × PAGE_H; we scale its CSS size by `zoom`
+// and the .pad-scroll container scrolls. pointFromEvent already maps pointer →
+// page coordinates via getBoundingClientRect, so drawing stays correct at any
+// zoom or scroll position with no extra math.
+function initViewport() {
+  fitWidth();
+  padScroll.scrollTop = 0;
   redraw();
 }
 
+function onResize() {
+  if (fitMode) fitWidth(); // keep the page fitted to the width until the user zooms
+}
+
+function applyZoom() {
+  canvas.style.width = Math.round(PAGE_W * zoom) + "px";
+  canvas.style.height = Math.round(PAGE_H * zoom) + "px";
+  zoomResetBtn.textContent = Math.round(zoom * 100) + "%";
+}
+
+// Fit the page width into the visible scroll area (accounting for the paper's
+// 28px margins), so the sheet fills the width and scrolls vertically.
+function fitWidth() {
+  const avail = padScroll.clientWidth - 2 * 28 - 4;
+  zoom = clampZoom(avail > 0 ? avail / PAGE_W : 1);
+  fitMode = true;
+  applyZoom();
+}
+
+function clampZoom(z) {
+  return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, z));
+}
+
+// Zoom to `z`, keeping the page point under (cx,cy) — a viewport point, default
+// the centre of the scroll area — fixed on screen.
+function setZoom(z, cx, cy) {
+  z = clampZoom(z);
+  const area = padScroll.getBoundingClientRect();
+  if (cx == null) { cx = area.left + area.width / 2; cy = area.top + area.height / 2; }
+  const before = canvas.getBoundingClientRect();
+  const px = (cx - before.left) / zoom; // page coords under the cursor
+  const py = (cy - before.top) / zoom;
+  zoom = z;
+  fitMode = false;
+  applyZoom();
+  // Re-measure after the reflow and nudge the scroll so (px,py) is back under
+  // the cursor. Increasing scrollLeft moves content left, so the delta is the
+  // amount the point drifted right of the cursor.
+  const after = canvas.getBoundingClientRect();
+  padScroll.scrollLeft += (after.left + px * zoom) - cx;
+  padScroll.scrollTop += (after.top + py * zoom) - cy;
+}
+
+function zoomIn(cx, cy) { setZoom(zoom * 1.25, cx, cy); }
+function zoomOut(cx, cy) { setZoom(zoom / 1.25, cx, cy); }
+function resetZoom() { fitWidth(); padScroll.scrollTop = 0; }
+
+// ---- Panning (hand tool / Space-drag) --------------------------------------
+function canPan() { return panMode || spaceHeld; }
+function updatePanCursor() { padScroll.classList.toggle("can-pan", canPan()); }
+
+function setPanMode(on) {
+  panMode = on;
+  panToggleBtn.classList.toggle("active", on);
+  updatePanCursor();
+}
+
+function beginPan(e) {
+  canvas.setPointerCapture(e.pointerId);
+  padScroll.classList.add("grabbing");
+  gesture = {
+    type: "pan",
+    startX: e.clientX,
+    startY: e.clientY,
+    startLeft: padScroll.scrollLeft,
+    startTop: padScroll.scrollTop,
+  };
+}
+
 function redraw() {
-  drawAllStrokes(ctx, strokes, canvas.width, canvas.height, background);
+  drawAllStrokes(ctx, strokes, canvas.width, canvas.height, background, bgImageEl);
 }
 
 // Batch full repaints to at most one per animation frame. Coalesced pointer
@@ -88,6 +169,8 @@ function requestRedraw() {
 // ---- Pointer capture -------------------------------------------------------
 canvas.addEventListener("pointerdown", (e) => {
   if (shouldRejectPalm(e)) return;
+  // Hand tool, Space-drag, or middle-mouse → pan the page instead of drawing.
+  if (canPan() || e.button === 1) { e.preventDefault(); beginPan(e); return; }
   if (e.pointerType === "pen") lastPenTime = performance.now();
   canvas.setPointerCapture(e.pointerId);
   strokeStartTime = performance.now();
@@ -121,6 +204,11 @@ canvas.addEventListener("pointerdown", (e) => {
 
 canvas.addEventListener("pointermove", (e) => {
   if (!gesture) return;
+  if (gesture.type === "pan") {
+    padScroll.scrollLeft = gesture.startLeft - (e.clientX - gesture.startX);
+    padScroll.scrollTop = gesture.startTop - (e.clientY - gesture.startY);
+    return;
+  }
   const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
 
   if (gesture.type === "eraser") {
@@ -149,6 +237,11 @@ canvas.addEventListener("pointermove", (e) => {
 
 function endGesture() {
   if (!gesture) return;
+  if (gesture.type === "pan") {
+    padScroll.classList.remove("grabbing");
+    gesture = null;
+    return;
+  }
   if (gesture.type === "shape") {
     const [a, b] = gesture.stroke.points;
     if (Math.hypot(b.x - a.x, b.y - a.y) < 3) {
@@ -191,6 +284,93 @@ function pointFromEvent(e) {
   };
 }
 
+// ---- Zoom / pan controls ---------------------------------------------------
+function isTypingTarget(el) {
+  return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+}
+
+zoomInBtn.addEventListener("click", () => zoomIn());
+zoomOutBtn.addEventListener("click", () => zoomOut());
+zoomResetBtn.addEventListener("click", resetZoom);
+panToggleBtn.addEventListener("click", () => setPanMode(!panMode));
+
+// Ctrl/⌘ + wheel (or pinch on a trackpad) zooms toward the cursor; a plain
+// wheel / two-finger swipe scrolls the page natively (up/down and sideways).
+padScroll.addEventListener("wheel", (e) => {
+  if (e.ctrlKey || e.metaKey) {
+    e.preventDefault();
+    setZoom(zoom * Math.exp(-e.deltaY * 0.0015), e.clientX, e.clientY);
+  }
+}, { passive: false });
+
+// Hold Space to drag-pan (swipe to scroll); release to go back to drawing.
+window.addEventListener("keydown", (e) => {
+  if (e.code === "Space" && !isTypingTarget(e.target) && !e.repeat) {
+    e.preventDefault();
+    spaceHeld = true;
+    updatePanCursor();
+  }
+});
+window.addEventListener("keyup", (e) => {
+  if (e.code === "Space") { spaceHeld = false; updatePanCursor(); }
+});
+
+// ---- Drop an image to trace over -------------------------------------------
+// Drop an image file onto the pad to place it as a background you can write
+// over. It's stored with the page (and shows in the viewer), but is NOT sent to
+// Claude — extraction only ever reads your ink, never the traced image.
+function setBgImage(dataUrl) {
+  bgImageData = dataUrl || null;
+  if (!dataUrl) { bgImageEl = null; redraw(); return; }
+  const img = new Image();
+  img.onload = () => { bgImageEl = img; redraw(); };
+  img.src = dataUrl;
+}
+
+// Read a dropped image and downscale it so the stored data URL stays small.
+function readScaledImage(file, maxDim, cb) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const w = Math.max(1, Math.round(img.width * scale));
+      const h = Math.max(1, Math.round(img.height * scale));
+      const oc = document.createElement("canvas");
+      oc.width = w; oc.height = h;
+      oc.getContext("2d").drawImage(img, 0, 0, w, h);
+      cb(oc.toDataURL("image/jpeg", 0.85));
+    };
+    img.onerror = () => cb(null);
+    img.src = reader.result;
+  };
+  reader.onerror = () => cb(null);
+  reader.readAsDataURL(file);
+}
+
+function handleDroppedFiles(files) {
+  const image = Array.from(files).find((f) => f.type && f.type.startsWith("image/"));
+  if (!image) { setStatus("Drop an image file to trace over.", "error"); return; }
+  readScaledImage(image, 1600, (url) => {
+    if (!url) { setStatus("Couldn't read that image.", "error"); return; }
+    setBgImage(url);
+    scheduleAutosave();
+    setStatus("Background image added — write over it (Clear removes it).");
+  });
+}
+
+function isFileDrag(e) { return e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files"); }
+["dragenter", "dragover"].forEach((ev) =>
+  padScroll.addEventListener(ev, (e) => { if (isFileDrag(e)) { e.preventDefault(); padScroll.classList.add("drop-hover"); } })
+);
+padScroll.addEventListener("dragleave", (e) => { if (e.target === padScroll) padScroll.classList.remove("drop-hover"); });
+padScroll.addEventListener("drop", (e) => {
+  padScroll.classList.remove("drop-hover");
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  handleDroppedFiles(e.dataTransfer.files);
+});
+
 // ---- Full-screen writing mode ----------------------------------------------
 // Hides the toolbar and (best-effort) enters browser fullscreen so the white
 // canvas fills the whole screen — aligning an absolute pen tablet's surface
@@ -206,7 +386,7 @@ function setFocus(on) {
     (document.exitFullscreen || document.webkitExitFullscreen || (() => {})).call(document)?.catch?.(() => {});
   }
   // The writable area changed size — refit the canvas on the next frame.
-  requestAnimationFrame(fitCanvasToScreen);
+  requestAnimationFrame(fitWidth);
 }
 function toggleFocus() { setFocus(!document.body.classList.contains("focus")); }
 
@@ -218,7 +398,7 @@ document.addEventListener("fullscreenchange", () => {
     document.body.classList.remove("focus");
     const btnUse = document.querySelector("#focusBtn use");
     if (btnUse) btnUse.setAttribute("href", "#i-maximize");
-    requestAnimationFrame(fitCanvasToScreen);
+    requestAnimationFrame(fitWidth);
   }
 });
 
@@ -292,6 +472,7 @@ function redo() {
 function clearPage() {
   pushHistory();
   strokes = [];
+  bgImageData = null; bgImageEl = null;
   redraw();
   updateHistoryButtons();
   scheduleAutosave();
@@ -371,6 +552,7 @@ async function savePage(navigate) {
       background,
       strokes,
       ocrText: noteText || null, // Note-Mode text → searchable
+      bgImage: bgImageData,      // traced-over image, if any
     };
     const url = editingId ? `/api/pages/${editingId}` : "/api/pages";
     const res = await fetch(url, {
@@ -383,7 +565,7 @@ async function savePage(navigate) {
     editingId = editingId || data.id;
     clearDraft();
     if (navigate) window.location.href = `/page/${editingId}`;
-    else setStatus("Saved ✓");
+    else setStatus(data.extractStatus === "pending" ? "Saved ✓ — extracting with Claude…" : "Saved ✓");
   } catch (err) {
     console.error(err);
     setStatus("Save failed — see console.", "error");
@@ -408,6 +590,7 @@ async function loadForEdit(id) {
       points: s.points.map((p) => ({ ...p, x: p.x * sx, y: p.y * sy })),
     }));
     history = []; future = [];
+    setBgImage(page.bgImage || null);
     redraw();
     updateHistoryButtons();
     setStatus("Editing saved page");
@@ -771,7 +954,7 @@ async function setNoteMode(on) {
   noteMode = on;
   document.body.classList.toggle("note-mode", on);
   document.getElementById("noteBtn").classList.toggle("note-on", on);
-  requestAnimationFrame(fitCanvasToScreen);
+  requestAnimationFrame(fitWidth);
   if (on) noteLineStart = strokes.length;
   if (on && !hwTried) {
     setNoteStatus();
@@ -1062,6 +1245,9 @@ window.addEventListener("keydown", (e) => {
     case "Enter": if (noteMode) { e.preventDefault(); commitLine(); } break;
     case "[": e.preventDefault(); nudgeWidth(-1); break;
     case "]": e.preventDefault(); nudgeWidth(1); break;
+    case "+": case "=": e.preventDefault(); zoomIn(); break;
+    case "-": case "_": e.preventDefault(); zoomOut(); break;
+    case "0": e.preventDefault(); resetZoom(); break;
     case "s": case "S": e.preventDefault(); openPages(); break;
     case "?": e.preventDefault(); toggleShortcuts(); break;
   }

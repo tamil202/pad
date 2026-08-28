@@ -111,12 +111,22 @@ function penWidth(baseWidth, p) {
   return Math.max(0.75, baseWidth * (0.4 + pressure * 1.2) * tiltFactor);
 }
 
-function drawAllStrokes(ctx, strokes, width, height, background) {
+function drawAllStrokes(ctx, strokes, width, height, background, bgImage) {
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, width, height);
+  if (bgImage) drawBgImage(ctx, bgImage, width, height);
   drawBackground(ctx, width, height, background || "blank");
   for (const stroke of strokes) drawStroke(ctx, stroke);
+}
+
+// A dropped background image to trace/annotate over: fit the whole image inside
+// the page (contain), centred, drawn under the paper lines and ink.
+function drawBgImage(ctx, img, width, height) {
+  if (!img || !img.width || !img.height) return;
+  const scale = Math.min(width / img.width, height / img.height);
+  const w = img.width * scale, h = img.height * scale;
+  try { ctx.drawImage(img, (width - w) / 2, (height - h) / 2, w, h); } catch (e) { /* image not ready */ }
 }
 
 // Ruled / grid / dotted paper, drawn under the ink.

@@ -14,6 +14,7 @@ import { randomUUID } from "crypto";
 export interface ExtractResult {
   text: string;
   mermaid: string | null;
+  answer: string | null; // worked answers to any math found on the page
 }
 
 // `claude` on PATH by default; override for a pinned path or a wrapper.
@@ -32,9 +33,10 @@ function buildPrompt(imagePath: string): string {
     "It is a single page of handwritten notes and/or sketches captured from a pen tablet (dark ink on white paper).",
     "Transcribe the page.",
     "Respond with ONLY a single JSON object and nothing else — no prose, no markdown fences. Use exactly these keys:",
-    '{"text": <string>, "mermaid": <string|null>}',
+    '{"text": <string>, "mermaid": <string|null>, "answer": <string|null>}',
     '- "text": the handwriting transcribed as plain text, preserving line breaks as \\n. Use an empty string if there is no writing.',
     '- "mermaid": Mermaid diagram source (e.g. a flowchart) ONLY if the page clearly depicts a diagram — boxes/arrows/flow. Otherwise null. Do not invent a diagram for plain prose.',
+    '- "answer": if the page contains any math — arithmetic, equations, or problems that expect a result (e.g. "2 × 2 = ?", "15% of 80", "solve x + 3 = 7") — work each one out and give the result, one per line, formatted as "<problem> = <result>". Use null if the page has no math to solve. Do not restate non-math text here.',
   ].join("\n");
 }
 
@@ -133,6 +135,7 @@ function parseInner(raw: string): ExtractResult {
       return {
         text: typeof obj.text === "string" ? obj.text : "",
         mermaid: typeof obj.mermaid === "string" && obj.mermaid.trim() ? obj.mermaid : null,
+        answer: typeof obj.answer === "string" && obj.answer.trim() ? obj.answer : null,
       };
     } catch {
       /* try the next candidate */
@@ -140,7 +143,7 @@ function parseInner(raw: string): ExtractResult {
   }
 
   // Couldn't recover JSON — fall back to treating the whole reply as the text.
-  return { text: raw.trim(), mermaid: null };
+  return { text: raw.trim(), mermaid: null, answer: null };
 }
 
 export async function extractPageImage(png: Buffer): Promise<ExtractResult> {

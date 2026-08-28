@@ -5,7 +5,8 @@ import crypto from "crypto";
 // This is a minimal file-based store so the app runs with zero external
 // dependencies. Swap this module for a MySQL/TypeORM repository later —
 // the shape of PageRecord is exactly what you'd put in a `pages` table:
-//   id, title, width, height, background, stroke_json, ocr_text, mermaid, created_at, updated_at
+//   id, title, width, height, background, stroke_json, ocr_text, mermaid,
+//   answer, bg_image, extract_status, extract_hash, extracted_at, created_at, updated_at
 
 export interface StrokePoint {
   x: number;
@@ -34,6 +35,13 @@ export interface Stroke {
 
 export type PaperBackground = "blank" | "ruled" | "grid" | "dotted";
 
+// Lifecycle of the automatic Claude extraction for a page:
+//   idle    — never extracted (or has no ink to extract)
+//   pending — an extraction is currently running
+//   done    — text/mermaid below reflect the current strokes
+//   error   — the last extraction attempt failed
+export type ExtractStatus = "idle" | "pending" | "done" | "error";
+
 export interface PageRecord {
   id: string;
   title: string;
@@ -43,6 +51,11 @@ export interface PageRecord {
   strokes: Stroke[];
   ocrText: string | null;
   mermaid: string | null;   // optional Mermaid diagram from Claude extraction
+  answer: string | null;    // worked answers to any math on the page (Claude extraction)
+  bgImage: string | null;   // optional dropped image (data URL) shown under the ink to trace over
+  extractStatus: ExtractStatus;
+  extractHash: string | null; // hash of the strokes that produced the current extraction
+  extractedAt: string | null; // when the current extraction finished
   createdAt: string;
   updatedAt: string;
 }
@@ -91,6 +104,11 @@ function normalize(record: any): PageRecord {
     })),
     ocrText: record.ocrText ?? null,
     mermaid: record.mermaid ?? null,
+    answer: record.answer ?? null,
+    bgImage: record.bgImage ?? null,
+    extractStatus: record.extractStatus ?? (record.ocrText || record.mermaid ? "done" : "idle"),
+    extractHash: record.extractHash ?? null,
+    extractedAt: record.extractedAt ?? null,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt ?? record.createdAt,
   };
@@ -104,6 +122,8 @@ export function createPage(input: {
   strokes: Stroke[];
   ocrText?: string | null;
   mermaid?: string | null;
+  answer?: string | null;
+  bgImage?: string | null;
 }): PageRecord {
   ensureDataDir();
   const now = new Date().toISOString();
@@ -116,6 +136,11 @@ export function createPage(input: {
     strokes: input.strokes,
     ocrText: input.ocrText ?? null,
     mermaid: input.mermaid ?? null,
+    answer: input.answer ?? null,
+    bgImage: input.bgImage ?? null,
+    extractStatus: input.ocrText || input.mermaid ? "done" : "idle",
+    extractHash: null,
+    extractedAt: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -135,6 +160,11 @@ export function updatePage(
     strokes?: Stroke[];
     ocrText?: string | null;
     mermaid?: string | null;
+    answer?: string | null;
+    bgImage?: string | null;
+    extractStatus?: ExtractStatus;
+    extractHash?: string | null;
+    extractedAt?: string | null;
   }
 ): PageRecord | null {
   const existing = getPage(id);
@@ -148,6 +178,11 @@ export function updatePage(
     ...(patch.strokes !== undefined ? { strokes: patch.strokes } : {}),
     ...(patch.ocrText !== undefined ? { ocrText: patch.ocrText } : {}),
     ...(patch.mermaid !== undefined ? { mermaid: patch.mermaid } : {}),
+    ...(patch.answer !== undefined ? { answer: patch.answer } : {}),
+    ...(patch.bgImage !== undefined ? { bgImage: patch.bgImage } : {}),
+    ...(patch.extractStatus !== undefined ? { extractStatus: patch.extractStatus } : {}),
+    ...(patch.extractHash !== undefined ? { extractHash: patch.extractHash } : {}),
+    ...(patch.extractedAt !== undefined ? { extractedAt: patch.extractedAt } : {}),
     updatedAt: new Date().toISOString(),
   };
   // id was already validated by the getPage() call above, so filePath(id) here

@@ -7,7 +7,7 @@
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <link rel="stylesheet" href="/style.css" />
 </head>
-<body>
+<body class="pad">
   <!-- Inline SVG icon sprite: one <symbol> per glyph, referenced with <use>. -->
   <svg width="0" height="0" style="position:absolute" aria-hidden="true">
     <defs>
@@ -45,6 +45,8 @@
       <symbol id="i-notes" viewBox="0 0 24 24"><line x1="21" y1="6" x2="3" y2="6"/><line x1="17" y1="10" x2="3" y2="10"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="15" y1="18" x2="3" y2="18"/></symbol>
       <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
       <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="3.5" cy="6" r="1.4"/><circle cx="3.5" cy="12" r="1.4"/><circle cx="3.5" cy="18" r="1.4"/></symbol>
+      <symbol id="i-hand" viewBox="0 0 24 24"><path d="M18 11V6a2 2 0 0 0-2-2 2 2 0 0 0-2 2M14 10V4a2 2 0 0 0-2-2 2 2 0 0 0-2 2v2M10 10.5V6a2 2 0 0 0-2-2 2 2 0 0 0-2 2v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/></symbol>
+      <symbol id="i-popout" viewBox="0 0 24 24"><path d="M21 11V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h5"/><rect x="12" y="12" width="9" height="7" rx="1"/></symbol>
     </defs>
   </svg>
 
@@ -99,6 +101,7 @@
       <button id="finishBtn" class="btn-primary" title="Save &amp; show the full page  (Ctrl+Enter)"><svg class="icon"><use href="#i-check" /></svg><span class="label">Finish</span></button>
       <button id="diagBtn" class="icon-only" title="Pen Diagnostics — live pressure / tilt / buttons  (D)" aria-label="Pen Diagnostics"><svg class="icon"><use href="#i-activity" /></svg></button>
       <button id="noteBtn" class="icon-only" title="Note Mode — handwriting → text, line by line  (N)" aria-label="Note Mode"><svg class="icon"><use href="#i-notes" /></svg></button>
+      <button id="popoutBtn" class="icon-only" title="Pop-out note pad — floats on top while you use other tabs; auto-extracts with Claude" aria-label="Pop-out note pad"><svg class="icon"><use href="#i-popout" /></svg></button>
       <a href="#" id="pagesLink" class="icon-only" title="Browse saved pages  (S)" aria-label="Saved pages"><svg class="icon"><use href="#i-layers" /></svg></a>
       <button id="focusBtn" class="icon-only" title="Full-screen writing — pad maps to the whole white area  (F)" aria-label="Full-screen writing"><svg class="icon"><use href="#i-maximize" /></svg></button>
       <button id="shortcutsBtn" class="icon-only" title="Keyboard shortcuts  (?)" aria-label="Keyboard shortcuts"><svg class="icon"><use href="#i-keyboard" /></svg></button>
@@ -108,8 +111,18 @@
   </header>
 
   <main class="pad-main">
-    <div class="paper">
-      <canvas id="padCanvas" width="1240" height="1754"></canvas>
+    <div class="pad-scroll" id="padScroll">
+      <div class="paper">
+        <canvas id="padCanvas" width="1240" height="1754"></canvas>
+      </div>
+    </div>
+
+    <div class="zoombar" id="zoombar" role="group" aria-label="Zoom">
+      <button id="panToggle" class="zoom-btn" title="Hand tool — drag the page to scroll  (Space)" aria-label="Hand tool"><svg class="icon"><use href="#i-hand" /></svg></button>
+      <span class="zoom-div"></span>
+      <button id="zoomOut" class="zoom-btn" title="Zoom out  (−)" aria-label="Zoom out">&minus;</button>
+      <button id="zoomReset" class="zoom-pct" title="Reset — fit to width  (0)">100%</button>
+      <button id="zoomIn" class="zoom-btn" title="Zoom in  (+)" aria-label="Zoom in">+</button>
     </div>
 
     <aside id="notePanel" class="note-panel">
@@ -234,6 +247,8 @@
       <li><span class="sc-desc"><svg class="icon icon-muted"><use href="#i-check" /></svg> Finish &amp; show full page</span><span class="keys"><kbd>Ctrl</kbd><kbd>Enter</kbd></span></li>
       <li><span class="sc-desc"><svg class="icon icon-muted"><use href="#i-trash" /></svg> Clear the page</span><span class="keys"><kbd>Ctrl</kbd><kbd>Backspace</kbd></span></li>
       <li><span class="sc-desc"><svg class="icon icon-muted"><use href="#i-size" /></svg> Decrease / increase width</span><span class="keys"><kbd>[</kbd><kbd>]</kbd></span></li>
+      <li><span class="sc-desc"><svg class="icon icon-muted"><use href="#i-search" /></svg> Zoom in / out · fit to width</span><span class="keys"><kbd>+</kbd><kbd>&minus;</kbd><kbd>0</kbd> <span class="or">or</span> <kbd>Ctrl</kbd>+wheel</span></li>
+      <li><span class="sc-desc"><svg class="icon icon-muted"><use href="#i-hand" /></svg> Scroll / pan the page (drag)</span><span class="keys">scroll · hold <kbd>Space</kbd> to drag</span></li>
       <li><span class="sc-desc"><svg class="icon icon-muted"><use href="#i-layers" /></svg> Open saved pages</span><span class="keys"><kbd>S</kbd></span></li>
       <li><span class="sc-desc"><svg class="icon icon-muted"><use href="#i-keyboard" /></svg> Toggle this help</span><span class="keys"><kbd>?</kbd></span></li>
       <li><span class="sc-desc"><svg class="icon icon-muted"><use href="#i-close" /></svg> Close any dialog</span><span class="keys"><kbd>Esc</kbd></span></li>
@@ -243,5 +258,6 @@
 
   <script src="/render.js"></script>
   <script src="/client.js"></script>
+  <script src="/popout.js"></script>
 </body>
 </html>

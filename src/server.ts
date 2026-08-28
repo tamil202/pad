@@ -41,6 +41,36 @@ function requireMcpAuth(req: Request, res: Response, next: NextFunction): void {
   next();
 }
 
+// Tiny in-memory rate limiter (no external deps). Keeps a sliding window of
+// recent request timestamps per limiter — fine for this single-user app — and
+// returns 429 with Retry-After once the window is full. Guards against runaway
+// clients and, on the extract route, caps how often the costly `claude -p`
+// subprocess can be spawned.
+function rateLimiter(opts: { windowMs: number; max: number; message?: string }) {
+  const hits: number[] = [];
+  return (_req: Request, res: Response, next: NextFunction): void => {
+    const now = Date.now();
+    const cutoff = now - opts.windowMs;
+    while (hits.length && hits[0] <= cutoff) hits.shift();
+    if (hits.length >= opts.max) {
+      const retryAfter = Math.max(1, Math.ceil((hits[0] + opts.windowMs - now) / 1000));
+      res.setHeader("Retry-After", String(retryAfter));
+      res.status(429).json({ error: opts.message || "Too many requests — slow down.", retryAfterSeconds: retryAfter });
+      return;
+    }
+    hits.push(now);
+    next();
+  };
+}
+
+// General API flood guard, plus a much stricter cap on Claude extractions.
+const apiLimiter = rateLimiter({ windowMs: 60_000, max: Number(process.env.API_RATE_MAX || 600) });
+const extractLimiter = rateLimiter({
+  windowMs: 60_000,
+  max: Number(process.env.EXTRACT_RATE_MAX || 15),
+  message: "Extraction rate limit reached — wait a moment before extracting again.",
+});
+
 app.disable("x-powered-by");
 app.set("etag", "strong"); // 304 revalidation instead of re-sending unchanged bodies
 
@@ -63,9 +93,11 @@ app.use(
 
 // ---- API ----------------------------------------------------------------
 
+app.use("/api", apiLimiter);
+
 // Save a new (finished or in-progress) page
 app.post("/api/pages", (req: Request, res: Response) => {
-  const { title, width, height, background, strokes, ocrText, mermaid } = req.body as {
+  const { title, width, height, background, strokes, ocrText, mermaid, bgImage } = req.body as {
     title?: string;
     width?: number;
     height?: number;
@@ -73,13 +105,16 @@ app.post("/api/pages", (req: Request, res: Response) => {
     strokes?: Stroke[];
     ocrText?: string | null;
     mermaid?: string | null;
+    bgImage?: string | null;
   };
 
   if (!width || !height || !Array.isArray(strokes)) {
     return res.status(400).json({ error: "width, height and strokes[] are required" });
   }
 
-  const page = createPage({ title, width, height, background, strokes, ocrText, mermaid });
+  const page = createPage({ title, width, height, background, strokes, ocrText, mermaid, bgImage });
+  // Pages save without extracting — Claude runs only on demand (see the extract
+  // endpoint), so writing/saving never triggers a CLI call.
   res.status(201).json({ id: page.id });
 });
 
@@ -106,7 +141,7 @@ app.get("/api/pages/:id", (req: Request, res: Response) => {
 
 // Update an existing page (edit strokes, rename, change background, store OCR)
 app.put("/api/pages/:id", (req: Request, res: Response) => {
-  const { title, width, height, background, strokes, ocrText, mermaid } = req.body as {
+  const { title, width, height, background, strokes, ocrText, mermaid, bgImage } = req.body as {
     title?: string;
     width?: number;
     height?: number;
@@ -114,6 +149,7 @@ app.put("/api/pages/:id", (req: Request, res: Response) => {
     strokes?: Stroke[];
     ocrText?: string | null;
     mermaid?: string | null;
+    bgImage?: string | null;
   };
   const updated = updatePage(req.params.id, {
     title,
@@ -123,6 +159,7 @@ app.put("/api/pages/:id", (req: Request, res: Response) => {
     strokes,
     ocrText,
     mermaid,
+    bgImage,
   });
   if (!updated) return res.status(404).json({ error: "not found" });
   res.json({ id: updated.id, updatedAt: updated.updatedAt });
@@ -135,18 +172,42 @@ app.delete("/api/pages/:id", (req: Request, res: Response) => {
   res.status(204).end();
 });
 
-// Extract a page's handwriting with Claude vision. Renders the stored ink to a
-// PNG, hands it to the local Claude CLI (native vision — no separate OCR step),
-// and saves the returned text + optional Mermaid diagram back onto the page so
-// it's searchable. This is the server-side "Claude replaces Textract" path;
-// Note Mode's client-side OCR remains the offline fallback.
-//
-// Each call spawns a `claude -p` subprocess, so it's intentionally on-demand
-// (not run on every save). In-flight guard keeps a burst of clicks from
-// launching many CLI processes at once for the same page.
+// Extract a page with Claude vision — ON DEMAND (the viewer's "Extract" button
+// or the pop-out's "Extract now"). The client sends the page image it already
+// composited — pen ink PLUS any dropped background image — so Claude reads both
+// and can answer questions written inside the image. If no image is sent we fall
+// back to rendering the strokes on the server. Saving a page never extracts, so
+// there are no repeated `claude -p` calls; the in-flight guard just stops a
+// double-click from launching two at once for the same page.
 const extractionsInFlight = new Set<string>();
 
-app.post("/api/pages/:id/extract", async (req: Request, res: Response) => {
+async function performExtraction(
+  id: string,
+  imageBuffer?: Buffer
+): Promise<{ text: string; mermaid: string | null; answer: string | null } | null> {
+  const page = getPage(id);
+  if (!page) return null;
+  const png = imageBuffer ?? (await renderPagePng(page));
+  const { text, mermaid, answer } = await extractPageImage(png);
+  updatePage(id, {
+    ocrText: text,
+    mermaid,
+    answer,
+    extractStatus: "done",
+    extractedAt: new Date().toISOString(),
+  });
+  return { text, mermaid, answer };
+}
+
+// Decode an optional client-supplied "data:image/...;base64,…" from the body.
+function imageFromBody(body: unknown): Buffer | undefined {
+  const dataUrl = body && typeof (body as any).image === "string" ? (body as any).image : null;
+  if (!dataUrl) return undefined;
+  const m = dataUrl.match(/^data:image\/\w+;base64,(.+)$/);
+  return m ? Buffer.from(m[1], "base64") : undefined;
+}
+
+app.post("/api/pages/:id/extract", extractLimiter, async (req: Request, res: Response) => {
   const id = req.params.id;
   const page = getPage(id);
   if (!page) return res.status(404).json({ error: "not found" });
@@ -154,14 +215,23 @@ app.post("/api/pages/:id/extract", async (req: Request, res: Response) => {
   if (extractionsInFlight.has(id)) {
     return res.status(409).json({ error: "extraction already in progress for this page" });
   }
+  const imageBuffer = imageFromBody(req.body);
   extractionsInFlight.add(id);
+  updatePage(id, { extractStatus: "pending" });
   try {
-    const png = await renderPagePng(page);
-    const { text, mermaid } = await extractPageImage(png);
-    const updated = updatePage(id, { ocrText: text, mermaid });
-    res.json({ id, text, mermaid, updatedAt: updated?.updatedAt });
+    const result = await performExtraction(id, imageBuffer);
+    const updated = getPage(id);
+    res.json({
+      id,
+      text: result?.text ?? "",
+      mermaid: result?.mermaid ?? null,
+      answer: result?.answer ?? null,
+      extractStatus: updated?.extractStatus,
+      updatedAt: updated?.updatedAt,
+    });
   } catch (err) {
     console.error("Claude extraction failed:", err);
+    updatePage(id, { extractStatus: "error" });
     res.status(502).json({ error: "extraction failed", detail: String((err as Error)?.message || err) });
   } finally {
     extractionsInFlight.delete(id);
@@ -240,13 +310,15 @@ app.get("/page/:id", (req: Request, res: Response) => {
     .extract-run:disabled{opacity:.6;cursor:progress}
     .extract-status{margin:12px 0;color:#64748b;min-height:1.2em}
     .extract-status.error{color:#dc2626}
-    .extract-text,.extract-mermaid{white-space:pre-wrap;word-break:break-word;background:rgba(0,0,0,.04);border-radius:8px;padding:12px;margin:8px 0 0}
+    .extract-text,.extract-mermaid,.extract-answer{white-space:pre-wrap;word-break:break-word;background:rgba(0,0,0,.04);border-radius:8px;padding:12px;margin:8px 0 0}
     .extract-mermaid{font-family:ui-monospace,monospace;font-size:12.5px}
+    .extract-answer{font-family:ui-monospace,monospace;font-size:13.5px;background:rgba(37,99,235,.10);color:#1d4ed8}
     .extract-panel h4{margin:18px 0 0;font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:#64748b}
     .extract-close{background:none;border:0;font-size:22px;line-height:1;cursor:pointer;color:inherit}
     @media (prefers-color-scheme:dark){
       .extract-panel{--panel-bg:#0f172a;--panel-fg:#e2e8f0}
       .extract-text,.extract-mermaid{background:rgba(255,255,255,.06)}
+      .extract-answer{background:rgba(96,165,250,.15);color:#93c5fd}
     }
   </style>
 
@@ -286,6 +358,8 @@ app.get("/page/:id", (req: Request, res: Response) => {
       <pre id="extractText" class="extract-text" hidden></pre>
       <h4 id="extractMermaidLabel" hidden>Mermaid diagram</h4>
       <pre id="extractMermaid" class="extract-mermaid" hidden></pre>
+      <h4 id="extractAnswerLabel" hidden>Answer</h4>
+      <pre id="extractAnswer" class="extract-answer" hidden></pre>
     </div>
   </aside>
 

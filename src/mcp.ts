@@ -69,12 +69,16 @@ export function createPadMcpServer(): McpServer {
     async ({ id }) => {
       const page = getPage(id);
       if (!page) return notFound(id);
-      const { strokes, ocrText, mermaid, ...meta } = page;
+      // extractHash is an internal dedup key and bgImage is a big data URL —
+      // leave both out of the MCP view (surface booleans instead).
+      const { strokes, ocrText, mermaid, answer, bgImage, extractHash, ...meta } = page;
       const details = {
         ...meta,
         strokeCount: strokes.length,
         hasExtractedText: !!ocrText,
         hasMermaid: !!mermaid,
+        hasAnswer: !!answer,
+        hasBackgroundImage: !!bgImage,
       };
       return { content: [{ type: "text", text: JSON.stringify(details, null, 2) }] };
     }
@@ -84,13 +88,13 @@ export function createPadMcpServer(): McpServer {
     "extract_page_text",
     {
       description:
-        "Get the extracted handwriting text for a saved page — the text captured by Note Mode's OCR, or by the on-demand Claude vision extraction, when the page was written. Includes a Mermaid diagram if one was extracted. Returns a note instead if the page has none.",
+        "Get the extracted handwriting text for a saved page — the text Claude vision transcribes automatically when a page is saved (or Note Mode's offline OCR). Includes a Mermaid diagram if one was extracted, and worked answers to any math on the page. Returns a note instead if the page has none.",
       inputSchema: { id: z.string().describe("Page id") },
     },
     async ({ id }) => {
       const page = getPage(id);
       if (!page) return notFound(id);
-      if (!page.ocrText && !page.mermaid) {
+      if (!page.ocrText && !page.mermaid && !page.answer) {
         return {
           content: [
             { type: "text", text: "(no extracted text — this page has no Note Mode or Claude-extracted text saved)" },
@@ -100,6 +104,7 @@ export function createPadMcpServer(): McpServer {
       const parts: string[] = [];
       if (page.ocrText) parts.push(page.ocrText);
       if (page.mermaid) parts.push("```mermaid\n" + page.mermaid + "\n```");
+      if (page.answer) parts.push("Answer:\n" + page.answer);
       return { content: [{ type: "text", text: parts.join("\n\n") }] };
     }
   );

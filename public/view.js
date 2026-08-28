@@ -22,6 +22,14 @@
   canvas.height = page.height;
   canvas.style.aspectRatio = `${page.width} / ${page.height}`;
 
+  // A dropped background image the page was traced over, if any (drawn under ink).
+  let bgImageEl = null;
+  if (page.bgImage) {
+    const im = new Image();
+    im.onload = () => { bgImageEl = im; renderAt(elapsed); };
+    im.src = page.bgImage;
+  }
+
   // Build a global replay timeline: each stroke's points carry timestamps
   // relative to that stroke's start, so we lay strokes end-to-end with a gap.
   const GAP = 160;
@@ -43,6 +51,7 @@
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
+    if (bgImageEl) drawBgImage(ctx, bgImageEl, canvas.width, canvas.height);
     drawBackground(ctx, canvas.width, canvas.height, page.background || "blank");
     for (const item of timeline) {
       if (ms >= item.start + item.dur) {
@@ -112,9 +121,11 @@
   });
 
   // ---- Claude text extraction panel --------------------------------------
-  // Sends the page to the server's /extract endpoint, which renders the ink to
-  // a PNG and has the Claude CLI read it (native vision → text + optional
-  // Mermaid). The result is saved on the page, so it prefills next time.
+  // Extraction runs automatically on the server when a page is saved: it renders
+  // the ink to a PNG and has the Claude CLI read it (native vision → text +
+  // optional Mermaid), storing the result on the page. This panel reflects that
+  // — it shows the stored result, live-updates while a background extraction is
+  // still running, and offers a manual re-run.
   const extractBtn = document.getElementById("extractBtn");
   const extractPanel = document.getElementById("extractPanel");
   const extractClose = document.getElementById("extractClose");
@@ -124,8 +135,25 @@
   const extractTextLabel = document.getElementById("extractTextLabel");
   const extractMermaidEl = document.getElementById("extractMermaid");
   const extractMermaidLabel = document.getElementById("extractMermaidLabel");
+  const extractAnswerEl = document.getElementById("extractAnswer");
+  const extractAnswerLabel = document.getElementById("extractAnswerLabel");
 
-  function showExtractResult(text, mermaid) {
+  let extractPolling = false;
+
+  function setStatus(msg, isError) {
+    extractStatus.textContent = msg;
+    extractStatus.className = isError ? "extract-status error" : "extract-status";
+  }
+
+  function hasResult(p) {
+    return !!(
+      (p.ocrText && p.ocrText.trim()) ||
+      (p.mermaid && p.mermaid.trim()) ||
+      (p.answer && p.answer.trim())
+    );
+  }
+
+  function showExtractResult(text, mermaid, answer) {
     const hasText = !!(text && text.trim());
     extractTextEl.textContent = hasText ? text : "(no handwriting text found)";
     extractTextEl.hidden = false;
@@ -134,16 +162,64 @@
     extractMermaidEl.textContent = hasMermaid ? mermaid : "";
     extractMermaidEl.hidden = !hasMermaid;
     extractMermaidLabel.hidden = !hasMermaid;
+    const hasAnswer = !!(answer && answer.trim());
+    extractAnswerEl.textContent = hasAnswer ? answer : "";
+    extractAnswerEl.hidden = !hasAnswer;
+    extractAnswerLabel.hidden = !hasAnswer;
+  }
+
+  // Paint the panel to match a page record's extraction state.
+  function reflectState(p) {
+    if (hasResult(p)) showExtractResult(p.ocrText, p.mermaid, p.answer);
+    if (p.extractStatus === "pending") {
+      setStatus("Extracting with Claude… this can take a while.");
+      extractRun.disabled = true;
+      extractRun.textContent = "Extracting…";
+    } else if (p.extractStatus === "error") {
+      setStatus("Automatic extraction failed — click to retry.", true);
+      extractRun.disabled = false;
+      extractRun.textContent = "Retry extraction";
+    } else if (hasResult(p)) {
+      setStatus(p.extractedAt ? "Extracted automatically ✓" : "Showing saved text.");
+      extractRun.disabled = false;
+      extractRun.textContent = "Re-extract with Claude";
+    } else {
+      setStatus("No text extracted yet.");
+      extractRun.disabled = false;
+      extractRun.textContent = "Extract with Claude";
+    }
+  }
+
+  // While the server is extracting in the background, re-fetch the page until
+  // it settles, so the text appears on its own without a reload.
+  async function pollExtraction() {
+    if (extractPolling) return;
+    extractPolling = true;
+    try {
+      for (let i = 0; i < 60; i++) { // ~3 min ceiling
+        await new Promise((r) => setTimeout(r, 3000));
+        const rr = await fetch(`/api/pages/${window.__PAGE_ID__}`);
+        if (!rr.ok) break;
+        const fresh = await rr.json();
+        page.ocrText = fresh.ocrText;
+        page.mermaid = fresh.mermaid;
+        page.answer = fresh.answer;
+        page.extractStatus = fresh.extractStatus;
+        page.extractedAt = fresh.extractedAt;
+        reflectState(fresh);
+        if (fresh.extractStatus !== "pending") break;
+      }
+    } catch (e) {
+      setStatus("Lost connection while extracting: " + (e && e.message ? e.message : e), true);
+    } finally {
+      extractPolling = false;
+    }
   }
 
   function openExtractPanel() {
     extractPanel.hidden = false;
-    if ((page.ocrText && page.ocrText.trim()) || (page.mermaid && page.mermaid.trim())) {
-      showExtractResult(page.ocrText, page.mermaid);
-      extractRun.textContent = "Re-extract with Claude";
-      extractStatus.textContent = "Showing previously extracted text.";
-      extractStatus.className = "extract-status";
-    }
+    reflectState(page);
+    if (page.extractStatus === "pending") pollExtraction();
   }
 
   extractBtn.addEventListener("click", openExtractPanel);
@@ -151,25 +227,41 @@
 
   extractRun.addEventListener("click", async () => {
     extractRun.disabled = true;
-    extractStatus.textContent = "Extracting with Claude… this can take a while.";
-    extractStatus.className = "extract-status";
+    setStatus("Extracting with Claude… this can take a while.");
     try {
-      const r = await fetch(`/api/pages/${window.__PAGE_ID__}/extract`, { method: "POST" });
+      // Send the fully-drawn page (ink + any traced background image) so Claude
+      // reads both and can answer questions written in the image.
+      renderAt(total);
+      elapsed = total; setScrubber();
+      const image = canvas.toDataURL("image/png");
+      const r = await fetch(`/api/pages/${window.__PAGE_ID__}/extract`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image }),
+      });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data.detail || data.error || `HTTP ${r.status}`);
       page.ocrText = data.text;
       page.mermaid = data.mermaid;
-      showExtractResult(data.text, data.mermaid);
+      page.answer = data.answer;
+      page.extractStatus = data.extractStatus || "done";
+      page.extractedAt = new Date().toISOString();
+      showExtractResult(data.text, data.mermaid, data.answer);
+      setStatus("Done ✓ — saved to the page.");
       extractRun.textContent = "Re-extract with Claude";
-      extractStatus.textContent = "Done ✓ — saved to the page.";
-      extractStatus.className = "extract-status";
     } catch (e) {
-      extractStatus.textContent = "Extraction failed: " + (e && e.message ? e.message : e);
-      extractStatus.className = "extract-status error";
+      setStatus("Extraction failed: " + (e && e.message ? e.message : e), true);
     } finally {
       extractRun.disabled = false;
     }
   });
+
+  // Auto-surface the result: if the server is extracting (or has extracted)
+  // this page, open the panel without a click — that's the point of making
+  // extraction automatic.
+  if (page.extractStatus === "pending" || hasResult(page)) {
+    openExtractPanel();
+  }
 
   window.addEventListener("keydown", (e) => {
     if (e.key === " ") { e.preventDefault(); playing ? pause() : play(); }
