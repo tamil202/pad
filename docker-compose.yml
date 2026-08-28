@@ -24,7 +24,7 @@ services:
 
     environment:
       NODE_ENV: production
-      PORT: "3010"
+      PORT: "3000"
       # ---- Remote MCP access --------------------------------------------------
       # Bearer token for POST/GET/DELETE /mcp. Set this explicitly so it's
       # stable across restarts — otherwise a fresh token is generated and
